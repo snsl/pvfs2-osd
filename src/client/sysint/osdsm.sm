@@ -1,0 +1,303 @@
+/*
+ * State machine to transfer OSD message pairs.
+ *
+ * Copyright (C) 2007 Pete Wyckoff <pw@osc.edu>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, version 2 of the License.
+ * 
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ * 
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#include <errno.h>
+#include <string.h>
+#include <src/common/gossip/gossip.h>
+#include <src/io/bmi/bmi.h>
+#include <src/io/bmi/bmi-method-support.h>   /* bmi_method_ops ... */
+#include <src/common/gen-locks/gen-locks.h>  /* gen_mutex_t ... */
+
+#include "client-state-machine.h"
+#include "msgpairarray.h"
+#include "pvfs2-debug.h"
+#include "pint-cached-config.h"
+#include "job.h"
+#include "gossip.h"
+#include "PINT-reqproto-encode.h"
+#include "pvfs2-util.h"
+#include "pint-util.h"
+#include "server-config-mgr.h"
+#include "pvfs2-internal.h"
+#include "osd-util/osd-util.h"
+
+enum
+{
+    MSGPAIRS_COMPLETE = 190,
+    MSGPAIRS_RETRY = 191,
+};
+
+%%
+
+/* all state machine names must start with these six characters */
+nested machine pvfs2_osd_msgpairarray_sm
+{
+    state init
+    {
+        run osd_msgpairarray_init;
+        default => post;
+    }
+
+    state post
+    {
+        run osd_msgpairarray_post;
+        MSGPAIRS_COMPLETE => all_complete;
+        default => one_complete;
+    }
+
+    state post_retry
+    {
+        run osd_msgpairarray_post_retry;
+        default => post;
+    }
+
+    state one_complete
+    {
+        run osd_msgpairarray_one_complete;
+        MSGPAIRS_COMPLETE => all_complete;
+        default => one_complete;
+    }
+
+    state all_complete
+    {
+        run osd_msgpairarray_all_complete;
+        MSGPAIRS_RETRY => post_retry;
+        default => done;
+    }
+
+    state done
+    {
+        run osd_msgpairarray_done;
+        default => return;
+    }
+}
+
+%%
+
+static int osd_msgpairarray_init(struct PINT_smcb *smcb, job_status_s *js_p)
+{
+    struct PINT_client_sm *sm_p = PINT_sm_frame(smcb, PINT_MSGPAIR_PARENT_SM);
+
+    int i = 0;
+    PINT_sm_msgpair_state *msg_p = NULL;
+
+    gossip_debug(GOSSIP_MSGPAIR_DEBUG, "%s\n", __func__);
+
+    js_p->error_code = 0;
+    
+    /* set number of operations that must complete.  */
+    sm_p->msgarray_op.params.comp_ct = sm_p->msgarray_op.count;
+
+    for (i = 0; i < sm_p->msgarray_op.count; i++)
+    {
+        msg_p = &sm_p->msgarray_op.msgarray[i];
+        assert(msg_p);
+
+        assert((msg_p->retry_flag == PVFS_MSGPAIR_RETRY) ||
+               (msg_p->retry_flag == PVFS_MSGPAIR_NO_RETRY));
+
+        msg_p->retry_count = 0;
+        if (msg_p->suppress) {
+            msg_p->complete = 1;
+            --sm_p->msgarray_op.params.comp_ct;
+        } else
+            msg_p->complete = 0;
+    }
+
+    return SM_ACTION_COMPLETE;
+}
+
+/*
+ * The following elements of the struct osd_msgair
+ * should be valid prior to this state (for each msgpair in array):
+ * - cdb
+ * - srv_addr of each element in msg array
+ *
+ * This state performs the following operations for each msgpair,
+ * one at a time:
+ * (1) posts the send of the request
+ * (2) stores job ids for later matching
+ *
+ */
+static int osd_msgpairarray_post(struct PINT_smcb *smcb, job_status_s *js_p)
+{
+    struct PINT_client_sm *sm_p = PINT_sm_frame(smcb, PINT_MSGPAIR_PARENT_SM);
+    int ret = -PVFS_EINVAL, i;
+    PINT_sm_msgpair_state *msg_p;
+
+    gossip_debug(
+        GOSSIP_MSGPAIR_DEBUG, "%s: sm %p "
+        "%d total message(s) with %d incomplete\n", __func__, sm_p,
+        sm_p->msgarray_op.count, sm_p->msgarray_op.params.comp_ct);
+
+    assert(sm_p->msgarray_op.count > 0);
+    assert(sm_p->msgarray_op.params.comp_ct >= 1);
+
+    for (i = 0; i < sm_p->msgarray_op.count; i++)
+    {
+        msg_p = &sm_p->msgarray_op.msgarray[i];
+
+        assert(msg_p);
+
+        /*
+          here we skip over the msgs that have already completed in
+          the case of being in the retry code path when it's ok
+        */
+
+        if (msg_p->complete)
+        {
+            continue;
+        }
+
+        msg_p->op_status = 0;
+
+        gossip_debug(GOSSIP_MSGPAIR_DEBUG,
+                     "%s: submit sm %p msgpair %d svr_addr %llx\n",
+                     __func__, sm_p, i, llu(msg_p->svr_addr));
+
+        ret = job_bmi_osd_submit(msg_p->svr_addr, &msg_p->osd_command, i,
+                                 sm_p->msgarray_op.params.job_context, smcb,
+                                 sm_p->msgarray_op.params.job_timeout);
+
+        if (ret < 0) {
+            PVFS_perror_gossip("Command submit failed", ret);
+            msg_p->op_status = ret;
+            msg_p->send_id = 0;
+            --sm_p->msgarray_op.params.comp_ct;
+        }
+    }
+
+    if (sm_p->msgarray_op.params.comp_ct == 0)
+    {
+        /* everything is completed already (could happen in some failure
+         * cases); jump straight to final completion function.
+         */
+         js_p->error_code = MSGPAIRS_COMPLETE;
+         return 1;
+    }
+
+    /* we are still waiting on operations to complete, next state
+     * transition will handle them
+     */
+    js_p->error_code = 0;
+    return SM_ACTION_DEFERRED;
+}
+
+static int osd_msgpairarray_post_retry(struct PINT_smcb *smcb,
+                                       job_status_s *js_p)
+{
+    struct PINT_client_sm *sm_p = PINT_sm_frame(smcb, PINT_FRAME_CURRENT);
+    job_id_t tmp_id;
+
+    gossip_debug(GOSSIP_MSGPAIR_DEBUG, "%s: sm %p, wait %d ms\n",
+      __func__, sm_p, sm_p->msgarray_op.params.retry_delay);
+
+    return job_req_sched_post_timer(
+        sm_p->msgarray_op.params.retry_delay,
+        sm_p, 0, js_p, &tmp_id,
+        sm_p->msgarray_op.params.job_context);
+}
+
+/*
+ * Don't look at command status, just retire them all.
+ */
+static int osd_msgpairarray_one_complete(struct PINT_smcb *smcb,
+                                         job_status_s *js_p)
+{
+    struct PINT_client_sm *sm_p = PINT_sm_frame(smcb, PINT_MSGPAIR_PARENT_SM);
+    PINT_sm_msgpair_state *msg_p;
+
+    gossip_debug(GOSSIP_MSGPAIR_DEBUG, "%s: sm %p tag %lld count %d\n",
+                 __func__, sm_p, lld(js_p->status_user_tag),
+                 sm_p->msgarray_op.count);
+
+
+    /* match operation with something in the msgpair array */
+    assert(js_p->status_user_tag < sm_p->msgarray_op.count);
+
+    msg_p = &sm_p->msgarray_op.msgarray[js_p->status_user_tag];
+    msg_p->recv_id = 0;
+
+    /* decrement comp_ct until all operations have completed */
+    --sm_p->msgarray_op.params.comp_ct;
+    if (sm_p->msgarray_op.params.comp_ct > 0) {
+        js_p->error_code = 0;
+        return SM_ACTION_DEFERRED;
+    } else {
+        gossip_debug(GOSSIP_MSGPAIR_DEBUG, "%s: all ops complete\n", __func__);
+        js_p->error_code = MSGPAIRS_COMPLETE;
+        return SM_ACTION_COMPLETE;
+    }
+}
+
+static int osd_msgpairarray_all_complete(struct PINT_smcb *smcb,
+                                         job_status_s *js_p)
+{
+    struct PINT_client_sm *sm_p = PINT_sm_frame(smcb, PINT_MSGPAIR_PARENT_SM);
+    int i;
+
+    js_p->error_code = 0;
+
+    gossip_debug(GOSSIP_MSGPAIR_DEBUG, "(%p) %s\n", sm_p, __func__);
+
+    for (i = 0; i < sm_p->msgarray_op.count; i++)
+    {
+        PINT_sm_msgpair_state *msg_p = &sm_p->msgarray_op.msgarray[i];
+        struct osd_command *command = &msg_p->osd_command;
+
+	/*
+	 * Can take multiple trips through this function as we retry
+	 * ones that failed.
+	 */
+
+	if (msg_p->complete)
+	    continue;
+
+        msg_p->op_status = command->status;
+
+        /* possibly let completion function change the status */
+        if (msg_p->comp_fn)
+            msg_p->op_status = msg_p->comp_fn(smcb, NULL, i);
+
+        /*
+         * It is okay for the error code to be negative here.  Used by
+         * PVFS for cases like when the server saying -PVFS_ENOENT for
+         * a missing entry during a lookup.  Also could be positive to
+         * let us pass through to a different state.
+         */
+        js_p->error_code = msg_p->op_status;
+
+        msg_p->complete = 1;
+
+        gossip_debug(GOSSIP_MSGPAIR_DEBUG, "%s: sm %p msgpair %d "
+                     "marked complete\n", __func__, sm_p, i);
+    }
+
+    return SM_ACTION_COMPLETE;
+}
+
+static int osd_msgpairarray_done(
+        struct PINT_smcb *smcb, job_status_s *js_p)
+{
+    int task_id, error_code, remaining;
+    PINT_sm_pop_frame(smcb, &task_id, &error_code, &remaining);
+    return SM_ACTION_COMPLETE;
+}
+
+/*
+ * vim: ts=8 sts=4 sw=4 expandtab ft=c
+ */

@@ -1,0 +1,214 @@
+/* 
+ * (C) 2003 Clemson University and The University of Chicago 
+ *
+ * See COPYING in top-level directory.
+ */
+
+/** \file
+ *  \ingroup mgmtint
+ *
+ *  PVFS2 management interface routines for sending "no operation"
+ *  (no-op) requests.  This is primarily used for verifying connectivity
+ *  to servers.
+ */
+
+#include <string.h>
+#include <assert.h>
+
+#include "client-state-machine.h"
+#include "pvfs2-debug.h"
+#include "job.h"
+#include "gossip.h"
+#include "str-utils.h"
+#include "pint-cached-config.h"
+#include "PINT-reqproto-encode.h"
+#include "bmi.h"
+#include "sense.h"
+#include "osd-util/osd-sense.h"
+
+extern job_context_id pint_client_sm_context;
+
+enum {
+    OSD_MSGPAIR = 2001,
+    RETRY = 2002
+};
+
+%%
+
+machine pvfs2_client_mgmt_noop_sm
+{
+    state setup_msgpair
+    {
+        run mgmt_noop_setup_msgpair;
+        OSD_MSGPAIR => xfer_osd_msgpair;
+        success => xfer_msgpair;
+        default => cleanup;
+    }
+
+    state xfer_osd_msgpair
+    {
+        jump pvfs2_osd_msgpairarray_sm;
+        RETRY => setup_msgpair;
+        default => cleanup;
+    }
+
+    state xfer_msgpair
+    {
+        jump pvfs2_msgpairarray_sm;
+        default => cleanup;
+    }
+
+    state cleanup
+    {
+        run mgmt_noop_cleanup;
+        default => terminate;
+    }
+}
+
+%%
+
+/** Initiate sending of no-op request to a specific server.
+ */
+PVFS_error PVFS_imgmt_noop(
+    PVFS_fs_id fs_id,
+    PVFS_credentials *credentials,
+    PVFS_BMI_addr_t addr,
+    PVFS_mgmt_op_id *op_id,
+    PVFS_hint hints,
+    void *user_ptr)
+{
+    PINT_smcb *smcb = NULL;
+    PINT_client_sm *sm_p = NULL;
+
+    gossip_debug(GOSSIP_CLIENT_DEBUG, "PVFS_imgmt_noop entered\n");
+
+    PINT_smcb_alloc(&smcb, PVFS_MGMT_NOOP,
+             sizeof(struct PINT_client_sm),
+             client_op_state_get_machine,
+             client_state_machine_terminate,
+             pint_client_sm_context);
+    if (!smcb)
+    {
+        return -PVFS_ENOMEM;
+    }
+    sm_p = PINT_sm_frame(smcb, PINT_FRAME_CURRENT);
+
+    PINT_init_msgarray_params(sm_p, fs_id);
+    PINT_init_sysint_credentials(sm_p->cred_p, credentials);
+    PINT_msgpair_init(&sm_p->msgarray_op);
+    sm_p->msgarray_op.msgpair.fs_id = fs_id;
+    sm_p->msgarray_op.msgpair.retry_flag = PVFS_MSGPAIR_NO_RETRY;
+    sm_p->msgarray_op.msgpair.svr_addr = addr;
+
+    PVFS_hint_copy(hints, &sm_p->hints);
+
+    gossip_debug(GOSSIP_CLIENT_DEBUG, "PVFS_mgmt_noop calling "
+                 "PINT_client_state_machine_post()\n");
+
+    return PINT_client_state_machine_post(
+        smcb,  op_id, user_ptr);
+}
+
+/** Send a no-op request to a specific server and receive response.
+ */
+PVFS_error PVFS_mgmt_noop(
+    PVFS_fs_id fs_id,
+    PVFS_credentials *credentials,
+    PVFS_BMI_addr_t addr,
+    PVFS_hint hints)
+{
+    PVFS_error ret = -PVFS_EINVAL, error = 0;
+    PVFS_mgmt_op_id op_id;
+
+    gossip_debug(GOSSIP_CLIENT_DEBUG, "PVFS_mgmt_noop entered\n");
+
+    ret = PVFS_imgmt_noop(fs_id, credentials, addr, &op_id, hints, NULL);
+    if (ret)
+    {
+        PVFS_perror_gossip("PVFS_imgmt_noop call", ret);
+        error = ret;
+    }
+    else
+    {
+        ret = PVFS_mgmt_wait(op_id, "noop", &error);
+        if (ret)
+        {
+            PVFS_perror_gossip("PVFS_mgmt_wait call", ret);
+            error = ret;
+        }
+    }
+
+    PINT_mgmt_release(op_id);
+    return error;
+}
+
+/*
+ * XXX: This can probably go now.  Recent tgtd (Mar 08) return the UA
+ * on any command, not just the first TUR.  Fixed up the python pvfs-init
+ * script to eat that at initialization, so should not see it here.
+ *
+ * Only used for OSD.  On a reset, device will return ASC_POWERON_RESET.
+ * Ideally we would have something else do a TUR to clear this initially,
+ * but this is the only app that sends TUR currently.  So retry.
+ */
+static int check_poweron_comp_fn(void *v_p, struct PVFS_server_resp *resp_p,
+                                 int index)
+{
+    PINT_smcb *smcb = v_p;
+    PINT_client_sm *sm_p = PINT_sm_frame(smcb, PINT_FRAME_CURRENT);
+    struct osd_command *command = &sm_p->msgarray_op.msgpair.osd_command;
+
+    gossip_debug(GOSSIP_CLIENT_DEBUG, "%s: status %d\n", __func__,
+                 command->status);
+    if (command->status == 2) {
+        int key, code;
+        osd_sense_extract(command->sense, command->sense_len, &key, &code);
+        gossip_debug(GOSSIP_CLIENT_DEBUG, "%s: key %d code %04x\n", __func__,
+                     key, code);
+        if (key == OSD_SSK_UNIT_ATTENTION && code == OSD_ASC_POWER_ON_OCCURRED)
+            return RETRY;
+    }
+    return osd_errno_from_status(command->status);
+}
+
+static PINT_sm_action mgmt_noop_setup_msgpair(
+        struct PINT_smcb *smcb, job_status_s *js_p)
+{
+    struct PINT_client_sm *sm_p = PINT_sm_frame(smcb, PINT_FRAME_CURRENT);
+    gossip_debug(GOSSIP_CLIENT_DEBUG,
+                 "noop state: mgmt_noop_setup_msgpair\n");
+
+    if (server_is_osd(sm_p->msgarray_op.msgpair.svr_addr)) {
+        osd_command_set_test_unit_ready(&sm_p->msgarray_op.msgpair.osd_command);
+        sm_p->msgarray_op.msgpair.comp_fn = check_poweron_comp_fn;
+        js_p->error_code = OSD_MSGPAIR;
+    } else {
+        PINT_SERVREQ_MGMT_NOOP_FILL(sm_p->msgarray_op.msgpair.req, *sm_p->cred_p, sm_p->hints);
+        js_p->error_code = 0;
+    }
+
+    PINT_sm_push_frame(smcb, 0, &sm_p->msgarray_op);
+    return SM_ACTION_COMPLETE;
+}
+
+static PINT_sm_action mgmt_noop_cleanup(
+        struct PINT_smcb *smcb, job_status_s *js_p)
+{
+    struct PINT_client_sm *sm_p = PINT_sm_frame(smcb, PINT_FRAME_CURRENT);
+    gossip_debug(GOSSIP_CLIENT_DEBUG, "noop state: mgmt_noop_cleanup\n");
+
+    sm_p->error_code = js_p->error_code;
+
+    PINT_SET_OP_COMPLETE;
+    return SM_ACTION_TERMINATE;
+}
+
+/*
+ * Local variables:
+ *  mode: c
+ *  c-indent-level: 4
+ *  c-basic-offset: 4
+ * End:
+ *
+ * vim: ft=c ts=8 sts=4 sw=4 expandtab
+ */

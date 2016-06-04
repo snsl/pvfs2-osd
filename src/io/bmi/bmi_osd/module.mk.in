@@ -1,0 +1,47 @@
+#
+# Makefile stub for bmi_ib.
+#
+# Copyright (C) 2003-6 Pete Wyckoff <pw@osc.edu>
+#
+# See COPYING in top-level directory.
+#
+# $Id: module.mk.in,v 1.13 2006/09/16 20:55:13 pw Exp $
+#
+
+#
+# Local definitions.
+#
+DIR := src/io/bmi/bmi_osd
+cfiles := osd.c
+
+#
+# Export these to the top Makefile to tell it what to build.
+#
+src := $(patsubst %,$(DIR)/%,$(cfiles))
+LIBSRC += $(src)
+
+#
+# Add extra include paths and warnings just for this directory.
+#
+cflags :=
+ifdef GNUC
+cflags += -W -Wcast-qual -Wshadow -Wwrite-strings
+endif
+
+#
+# Extra cflags for files in this directory.
+#
+MODCFLAGS_$(DIR) := $(cflags)
+
+#
+# Global libs for osd initiator.  And pickup all sorts of includes from
+# osd-initiator, osd-target, util.
+#
+CFLAGS += -I$(srcdir)/../osd-initiator -I$(srcdir)/..
+deplibs := $(srcdir)/../osd-initiator/libosdinit.a \
+	   $(srcdir)/../osd-util/libosdutil.a -lm
+LIBS += $(deplibs) -lm
+
+# hack, force dependency on these external libs
+$(LIBRARIES): $(deplibs)
+

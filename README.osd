@@ -1,0 +1,181 @@
+PVFS modifications to support object-based storage devices, to
+store data, metadata, and directory objects.  This work comes
+from an NSF-funded project to examine the use of OSDs in parallel
+file systems.
+
+The rest of this document is a "how to" build and use this OSD-enabled
+version of PVFS.
+
+Note that the copyright on the OSD modifications is GPLv2 while the rest
+of PVFS is distributed under LGPLv2.  This is to be consistent with the
+rest of the OSC OSD software distribution which is also GPLv2.
+
+Copyright (C) 2007-8 OSD Team <pvfs-osd@osc.edu>
+Copyright (C) 2007 Pete Wyckoff <pw@osc.edu>
+
+Initial import from pvfs CVS on 5 feb 07 20:47:00 EST.
+Merge from CVS on Sat Feb 17 16:38:18 EST 2007.
+Merge from CVS on Wed Dec  5 15:00:48 EST 2007.
+-------------------------------------------------------------------------------
+
+To configure:
+    CFLAGS=-g ./configure --without-openssl --disable-karma --disable-thread-safety --enable-strict --enable-shared --disable-static --prefix=/usr/local
+
+Or, with optimization:
+    CFLAGS="-O3 -DNDEBUG" ./configure --without-openssl --disable-karma --disable-thread-safety --enable-strict --enable-shared --disable-static --prefix=/usr/local
+
+Or, with IB, but shared libs will not work:
+    CFLAGS="-O3 -DNDEBUG" ./configure --without-openssl --disable-karma --disable-thread-safety --enable-strict --disable-static --enable-shared --prefix=/usr/local --with-openib=/usr/local/openib-iser --without-bmi-tcp
+
+To build kernel module, add:
+    --with-kernel=/usr/src/linux
+
+On opt, with IB and kernel:
+
+    CFLAGS="-O3 -DNDEBUG" ./configure --without-openssl --disable-karma --disable-thread-safety --enable-strict --disable-static --enable-shared --prefix=/usr/local --with-openib=/usr --without-bmi-tcp --with-kernel=/home/pw/src/osd/linux
+
+Then to build and install locally, in ./install:
+    make
+    make install
+
+To build and install kernel:
+    make kmod
+    make kmod_install KMOD_DIR=$(pwd)/install/sbin
+
+To clean everything:
+    rm -rf install
+    make distclean
+
+As you edit, don't forget to re-install things when you rebuild, else
+test codes will not see your new codes and library:
+
+    make && make install
+
+Depending on your Makefile, you may have to rebuild PVFS test codes
+by hand.
+
+To run, it is best to go through the PBS batch system.  You need one
+node to be the metadata server, one or more to be the IO servers, and
+one to be the client.  The minimal configuration is thus 3.
+
+Do this on titan to start up a job that you can keep for 8 hours (the
+default is only 1 hour):
+
+    qsub -I -l nodes=3:ppn=2 -l walltime=8:00:00
+
+Now make sure you have your installed PVFS directory in your path, and
+that you don't have any other pvfs binaries there.  Put all this in
+your ~/.bashrc:
+
+    export PATH=$HOME/osd/pvfs/install/bin:$HOME/osd/pvfs/install/sbin:$PATH
+    export LD_LIBRARY_PATH=$HOME/osd/pvfs/lib
+    alias perf=$HOME/osd/osd-util/perf.py
+
+Invoke this script to startup 1 combined normal PVFS metadata+IO server, and
+all other nodes will be clients.
+
+    perf -mio start 1
+
+Then cut-n-paste the line that looks like:
+
+    export PVFS2TAB_FILE=/tmp/pbstmp.2433/pvfs2tab
+
+so that pvfs2 programs can find your file system.
+
+To stop it all:
+
+    perf stop
+
+Or to stop then start:
+
+    perf restart 1
+
+If you want more targets, make the number higher.
+
+The metaserver node runs pvfs2-server and puts its errors into
+$TMPDIR/pvfs2.log
+
+The IO nodes do "tgtd -d 9" and put errors into $TMPDIR/tgtd.log.
+Now it assumes the tgtd executable is in your ~/src/osd/osd-target/tgtd.
+
+All the other nodes start up iscsid and connect to the IO targets.
+
+
+Debugging
+---------
+
+You can set the environment variable PVFS2_DEBUGMASK=all to get debug
+messages to your console.  Other levels are available besides all.  To send
+the messages to a file add PVFS2_DEBUGFILE=client-debug.out or similar.  To
+debug the metadata servers, do "pvfs2-set-debugmask -m /pvfs verbose" then
+look for messages in $TMPDIR/pvfs2.log on each server.
+
+
+Running MPI programs
+--------------------
+
+You need to build your MPI program by hand, getting all the paths to
+the PVFS, OSD, and MPI libraries correct.  Do not just use "mpicc".
+We'll also only build static executables to make sure that all the
+versions are correct, so don't forget to rebuild whenever you install
+a new PVFS or build a new OSD library, for instance.  Remember, you
+always must do "make install" for PVFS to push the library to its
+destination.
+
+Start with the example Makefile here:
+
+    ~pw/src/tests/io/pvfs/Makefile
+
+and copy it to wherever your MPI program resides.  You will have
+to change it to do two things:  specify the name of the program
+to build (perf.c), and change the location of the libraries.  Take
+a look at the "OSD :=" line to see how.
+
+Later we'll want to change the libs to use optimized versions of
+all the programs including MPI.  For now, these will work okay.  (Don't
+worry about the "openib" name in the MPI path, it's really not using IB.)
+
+To run codes, start up an interactive batch job as usual.  Then use the
+"perf.qs" script to start up the number of OSD targets you want, call it
+N_osd.  Out of the total number of nodes you ask for in the PBS
+allocation with qsub, call it N_nodes, one will be a dedicated metadata
+server, N_osd will run OSD servers, and N_clients will be available for
+running the MPI program, where N_clients = N_nodes - N_osd - 1.  Be sure
+not to run clients and OSD targets on the same node, for instance, as
+performance numbers will be unreliable.  When you run the perf.qs
+script, it tells you which nodes are the clients.
+
+We use mpiexec to get the code going.  It automatically allocates
+starting on the client nodes first, so you just have to be careful of
+the total number of clients, not be aware of the particular hostnames.
+Here's one line:
+
+	mpiexec -n 2 -pernode ./perf -s 10m -f pvfs2:/pvfs/foo
+
+That says to run two processes, but only put one process per node even
+though these are SMPs.  It runs the code "perf" with all the arguments
+that come after it on the command line.
+
+
+Compiling PVFS2 tests
+---------------------
+These are in the pvfs source directory, subdirectory test.  It has its
+own configure process.  Chdir into test, then do something like this.
+
+    OSD=/home/pw/src/osd CFLAGS=-g ./configure --without-openssl
+    make
+    make install
+
+That puts all the tests in with your PVFS install, in a new test/
+directory there.
+
+
+Building the PVFS kernel module
+-------------------------------
+[alin@titan]$ CFLAGS="-O3 -DNDEBUG" ./configure --without-openssl --disable-karma --disable-thread-safety --enable-strict --with-kernel=/usr/src/linux --prefix=/usr/local
+
+[alin@titan]$ make kmod
+[alin@titan]$ KMOD_DIR=./install make kmod_install
+
+# vim: set tw=72 :
+
